@@ -25,12 +25,57 @@ TOKEN_FILE = (
     else os.path.join(SCRIPT_DIR, 'oauth_tokens.json')
 )
 
+# --- Serverless / no-disk mode -------------------------------------------
+# On a host with no writable disk (Vercel and similar), the token cannot live in
+# a file. Set BASECAMP_TOKEN_SOURCE=env and supply BASECAMP_CLIENT_ID,
+# BASECAMP_CLIENT_SECRET and BASECAMP_REFRESH_TOKEN as environment variables.
+# The access token is then fetched with the refresh token and held in memory.
+# Basecamp refresh tokens do not rotate, so this sustains itself without ever
+# writing anything back.
+_ENV_MODE = os.environ.get('BASECAMP_TOKEN_SOURCE', 'file').strip().lower() == 'env'
+_env_cache = {}
+
+def _env_refresh():
+    """Fetch a fresh access token using the refresh token from the environment."""
+    from basecamp_oauth import BasecampOAuth
+    oauth = BasecampOAuth(
+        client_id=os.environ['BASECAMP_CLIENT_ID'],
+        client_secret=os.environ['BASECAMP_CLIENT_SECRET'],
+        redirect_uri=os.environ.get('BASECAMP_REDIRECT_URI', 'https://example.invalid/callback'),
+        user_agent=os.environ.get('USER_AGENT', 'Basecamp MCP'),
+    )
+    payload = oauth.refresh_token(os.environ['BASECAMP_REFRESH_TOKEN'])
+    expires_in = payload.get('expires_in', 1209600)  # Basecamp issues 14 days
+    _env_cache['basecamp'] = {
+        'access_token': payload['access_token'],
+        'refresh_token': os.environ['BASECAMP_REFRESH_TOKEN'],
+        'account_id': os.environ.get('BASECAMP_ACCOUNT_ID'),
+        'expires_at': (datetime.now() + timedelta(seconds=int(expires_in))).isoformat(),
+        'updated_at': datetime.now().isoformat(),
+    }
+    _logger.info("Refreshed Basecamp access token from environment refresh token.")
+    return _env_cache['basecamp']
+
+def _env_tokens():
+    """Return the in-memory token, refreshing it when missing or near expiry."""
+    data = _env_cache.get('basecamp')
+    if data:
+        try:
+            # Refresh a little early so a call never lands on an expired token.
+            if datetime.fromisoformat(data['expires_at']) - timedelta(minutes=5) > datetime.now():
+                return data
+        except (ValueError, KeyError):
+            pass
+    return _env_refresh()
+
 # Lock for thread-safe operations
 _lock = threading.Lock()
 _logger = logging.getLogger(__name__)
 
 def _read_tokens():
     """Read tokens from storage."""
+    if _ENV_MODE:
+        return {'basecamp': _env_tokens()}
     try:
         with open(TOKEN_FILE, 'r') as f:
             data = json.load(f)
@@ -48,6 +93,10 @@ def _read_tokens():
 
 def _write_tokens(tokens):
     """Write tokens to storage."""
+    if _ENV_MODE:
+        # No writable disk. Hold it in memory only.
+        _env_cache.update(tokens)
+        return True
     # Create directory for the token file if it doesn't exist
     os.makedirs(os.path.dirname(TOKEN_FILE) if os.path.dirname(TOKEN_FILE) else '.', exist_ok=True)
 

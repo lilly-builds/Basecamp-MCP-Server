@@ -7,6 +7,7 @@ Anthropic FastMCP framework, replacing the custom JSON-RPC implementation.
 """
 
 import base64
+import asyncio
 import logging
 import os
 import sys
@@ -33,26 +34,72 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DOTENV_PATH = os.path.join(PROJECT_ROOT, '.env')
 load_dotenv(DOTENV_PATH)
 
-# Set up logging to file AND stderr (following MCP best practices)
-LOG_FILE_PATH = os.path.join(PROJECT_ROOT, 'basecamp_fastmcp.log')
+# Set up logging to file AND stderr (following MCP best practices).
+# The file handler is best-effort: a serverless host (Vercel and similar) has a
+# read-only filesystem, and creating the file there raises at import time, which
+# takes the whole server down before it can serve anything. Where the log file
+# cannot be opened we keep stderr, which those platforms capture anyway.
+LOG_FILE_PATH = os.environ.get(
+    'BASECAMP_MCP_LOG_FILE', os.path.join(PROJECT_ROOT, 'basecamp_fastmcp.log')
+)
+_handlers = [logging.StreamHandler(sys.stderr)]  # Critical: stderr, not stdout
+try:
+    _handlers.insert(0, logging.FileHandler(LOG_FILE_PATH))
+except OSError:
+    pass
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE_PATH),
-        logging.StreamHandler(sys.stderr)  # Critical: log to stderr, not stdout
-    ]
+    handlers=_handlers
 )
 logger = logging.getLogger('basecamp_fastmcp')
 
-# Initialize FastMCP server
-mcp = FastMCP("basecamp")
+# Initialize FastMCP server. The OAuth broker is opt-in so the existing stdio
+# configuration remains file-token based until the production migration is enabled.
+_multi_user_provider = None
+if os.environ.get("BASECAMP_MCP_MULTI_USER_AUTH") == "1":
+    from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+    from multi_user_auth import BasecampOAuthProvider
+
+    _multi_user_provider = BasecampOAuthProvider()
+    _issuer = os.environ["BASECAMP_MCP_PUBLIC_URL"].rstrip("/")
+    mcp = FastMCP(
+        "basecamp",
+        auth_server_provider=_multi_user_provider,
+        auth=AuthSettings(
+            issuer_url=_issuer,
+            resource_server_url=_issuer + "/mcp",
+            required_scopes=["basecamp"],
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True, valid_scopes=["basecamp"], default_scopes=["basecamp"]
+            ),
+        ),
+    )
+else:
+    mcp = FastMCP("basecamp")
+
+
+if _multi_user_provider is not None:
+    @mcp.custom_route("/basecamp/callback", methods=["GET"])
+    async def basecamp_oauth_callback(request):
+        """Finish the Basecamp side of Claude's OAuth authorization flow."""
+        return await _multi_user_provider.callback(request)
 
 # Auth helper functions (reused from original server)
 def _get_basecamp_client() -> Optional[BasecampClient]:
     """Get authenticated Basecamp client (sync version from original server)."""
     try:
-        token_data = token_storage.get_token()
+        token_data = None
+        if _multi_user_provider is not None:
+            from mcp.server.auth.middleware.auth_context import get_access_token
+            principal = get_access_token()
+            if principal and principal.subject:
+                # This helper is called inside a worker thread by MCP tools, so a
+                # short private event loop is safe here and preserves the request's
+                # context-derived user identity.
+                token_data = asyncio.run(_multi_user_provider.basecamp_token(principal.subject))
+        if token_data is None:
+            token_data = token_storage.get_token()
         logger.debug(
             "Token data retrieved: has_access_token=%s has_refresh_token=%s account_id=%s expires_at=%s",
             bool(token_data and token_data.get('access_token')),
@@ -66,7 +113,7 @@ def _get_basecamp_client() -> Optional[BasecampClient]:
             return None
 
         # Check and automatically refresh if token is expired
-        if not auth_manager.ensure_authenticated():
+        if _multi_user_provider is None and not auth_manager.ensure_authenticated():
             logger.error("OAuth token has expired and automatic refresh failed")
             return None
 
@@ -2852,6 +2899,27 @@ async def reposition_todolist_group(
 # 🎉 COMPLETE FastMCP server with ALL tools migrated!
 
 if __name__ == "__main__":
-    logger.info("Starting Basecamp FastMCP server")
-    # Run using official MCP stdio transport
-    mcp.run(transport='stdio')
+    # Transport is selectable so the same server can run two ways:
+    #   stdio            - launched as a child process by Claude Code (default)
+    #   streamable-http  - long-running server behind a URL, for claude.ai connectors
+    # Default stays stdio so existing Claude Code setups are unaffected.
+    transport = os.environ.get('BASECAMP_MCP_TRANSPORT', 'stdio').strip()
+
+    if transport == 'stdio':
+        logger.info("Starting Basecamp FastMCP server (stdio)")
+        mcp.run(transport='stdio')
+    elif transport in ('streamable-http', 'http'):
+        # PORT is what most hosts (Railway, Fly, Cloud Run) inject.
+        mcp.settings.host = os.environ.get('HOST', '0.0.0.0')
+        mcp.settings.port = int(os.environ.get('PORT', '8080'))
+        logger.info(
+            "Starting Basecamp FastMCP server (streamable-http) on %s:%s%s",
+            mcp.settings.host, mcp.settings.port, mcp.settings.streamable_http_path,
+        )
+        mcp.run(transport='streamable-http')
+    else:
+        logger.error(
+            "Unknown BASECAMP_MCP_TRANSPORT=%r. Use 'stdio' or 'streamable-http'.",
+            transport,
+        )
+        sys.exit(2)

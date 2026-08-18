@@ -69,3 +69,5 @@ reference/
 local_queries/
 
 AGENTS.md
+.vercel
+.env*.local
