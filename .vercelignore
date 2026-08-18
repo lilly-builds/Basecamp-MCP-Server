@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+*.log
+oauth_tokens.json
+.env
+tests/
+examples/

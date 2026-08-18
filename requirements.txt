@@ -12,3 +12,5 @@ pytest==7.4.0
 mcp[cli]>=1.28.1,<2
 httpx>=0.25.0
 anyio>=4.0.0
+# Used to encrypt each person's Basecamp refresh token before it is stored in KV.
+cryptography>=43,<46
